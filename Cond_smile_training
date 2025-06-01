@@ -1,0 +1,284 @@
+import os
+import argparse
+import torch
+import esm
+from Bio import PDB
+from torch.utils.data import DataLoader
+from rdkit import Chem
+import torch.nn as nn
+import csv
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MAX_LEN = 100
+TEMPERATURE = 0.7
+ROOT_DIR = "v2013-core"  # Adjust to your dataset folder path
+
+# Helper functions
+
+def extract_protein_sequence(pdb_file):
+    parser = PDB.PDBParser(QUIET=True)
+    structure = parser.get_structure('protein', pdb_file)
+    ppb = PDB.PPBuilder()
+    seq = ''
+    for pp in ppb.build_peptides(structure):
+        seq += str(pp.get_sequence())
+    return seq
+
+def rebuild_stoi(root_dir):
+    all_smiles = []
+    for prot in os.listdir(root_dir):
+        p = os.path.join(root_dir, prot)
+        if not os.path.isdir(p):
+            continue
+        for f in os.listdir(p):
+            if f.endswith('.mol2') or f.endswith('.sdf'):
+                smi = Chem.MolToSmiles(Chem.MolFromMol2File(os.path.join(p, f)))
+                if smi:
+                    all_smiles.append(smi)
+                break
+    specials = ["<pad>", "<bos>", "<eos>", "<unk>"]
+    chars = sorted(set("".join(all_smiles)))
+    itos = specials + chars
+    stoi = {ch: i for i, ch in enumerate(itos)}
+    return stoi, itos
+
+# Model classes
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, latent_dim, num_layers, protein_embed_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers, batch_first=True)
+        self.protein_proj = nn.Linear(protein_embed_dim, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+    def forward(self, x, protein_emb):
+        emb = self.embedding(x)
+        _, (h_n, _) = self.lstm(emb)
+        h = h_n[-1]
+        prot_h = self.protein_proj(protein_emb)
+        h = h + prot_h
+        return self.fc_mu(h), self.fc_logvar(h)
+
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, latent_dim, num_layers, protein_embed_dim, stoi):
+        super().__init__()
+        self.stoi = stoi
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.latent_to_hidden = nn.Linear(latent_dim + protein_embed_dim, hidden_dim * num_layers)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers, batch_first=True)
+        self.output = nn.Linear(hidden_dim, vocab_size)
+
+    def forward(self, z, protein_emb, target=None, teacher_forcing_ratio=0.5):
+        batch = z.size(0)
+        z_cond = torch.cat([z, protein_emb], dim=1)
+        hidden = self.latent_to_hidden(z_cond)
+
+        # Debug prints - remove or comment out after verifying shapes
+        print(f"z_cond shape: {z_cond.shape}")
+        print(f"latent_to_hidden output shape: {hidden.shape}")
+
+        hidden = hidden.view(self.lstm.num_layers, batch, -1)
+        print(f"hidden reshaped to: {hidden.shape}")
+
+        cell = torch.zeros_like(hidden)
+        print(f"cell shape: {cell.shape}")
+
+        input_idx = torch.full((batch,), self.stoi['<bos>'], device=z.device, dtype=torch.long)
+        outputs = []
+
+        for t in range(MAX_LEN - 1):
+            emb = self.embedding(input_idx)
+            emb = emb.unsqueeze(1)
+            out, (hidden, cell) = self.lstm(emb, (hidden, cell))
+            logits = self.output(out.squeeze(1))
+            outputs.append(logits.unsqueeze(1))
+
+            if target is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                input_idx = target[:, t]
+            else:
+                probs = torch.softmax(logits / TEMPERATURE, dim=-1)
+                input_idx = torch.multinomial(probs, 1).squeeze(-1)
+                if input_idx.dim() == 0:
+                    input_idx = input_idx.unsqueeze(0)
+
+
+        return torch.cat(outputs, dim=1)
+
+class VAE(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, latent_dim, num_layers, protein_embed_dim, stoi):
+        super().__init__()
+        self.stoi = stoi
+        self.enc = Encoder(vocab_size, embed_dim, hidden_dim, latent_dim, num_layers, protein_embed_dim)
+        self.dec = Decoder(vocab_size, embed_dim, hidden_dim, latent_dim, num_layers, protein_embed_dim, stoi)
+
+    def reparameterize(self, mu, logvar):
+        std = (0.5 * logvar).exp()
+        return mu + std * torch.randn_like(std)
+
+    def forward(self, x, protein_emb, tgt, r):
+        mu, logvar = self.enc(x, protein_emb)
+        z = self.reparameterize(mu, logvar)
+        out = self.dec(z, protein_emb, tgt, teacher_forcing_ratio=r)
+        return out, mu, logvar
+
+# Evaluation functions
+
+def calculate_validity(smiles_list):
+    valid_count = 0
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is not None:
+            valid_count += 1
+    validity = valid_count / len(smiles_list) if smiles_list else 0
+    return validity
+
+def calculate_uniqueness(smiles_list):
+    uniqueness = len(set(smiles_list)) / len(smiles_list) if smiles_list else 0
+    return uniqueness
+
+def calculate_novelty(generated_smiles, training_smiles):
+    novel_smiles = set(generated_smiles) - set(training_smiles)
+    novelty = len(novel_smiles) / len(generated_smiles) if generated_smiles else 0
+    return novelty
+
+def mol_weights(smiles_list):
+    weights = []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol:
+            weights.append(Descriptors.MolWt(mol))
+    return weights
+
+def check_3d_conformer_validity(smiles_list):
+    valid_count = 0
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        mol = Chem.AddHs(mol)
+        try:
+            AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+            valid_count += 1
+        except:
+            pass
+    return valid_count / len(smiles_list) if smiles_list else 0
+
+def evaluate_model(generated_smiles, training_smiles):
+    validity = calculate_validity(generated_smiles)
+    uniqueness = calculate_uniqueness(generated_smiles)
+    novelty = calculate_novelty(generated_smiles, training_smiles)
+    conformer_validity = check_3d_conformer_validity(generated_smiles)
+
+    print(f"Validity: {validity*100:.2f}%")
+    print(f"Uniqueness: {uniqueness*100:.2f}%")
+    print(f"Novelty: {novelty*100:.2f}%")
+    print(f"3D Conformer Validity: {conformer_validity*100:.2f}%")
+
+    train_mw = mol_weights(training_smiles)
+    gen_mw = mol_weights(generated_smiles)
+
+    plt.hist(train_mw, bins=30, alpha=0.5, label='Training Set')
+    plt.hist(gen_mw, bins=30, alpha=0.5, label='Generated')
+    plt.xlabel("Molecular Weight")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.title("Molecular Weight Distribution")
+    plt.show()
+
+# Build vocab and load model
+
+stoi, itos = rebuild_stoi(ROOT_DIR)
+
+model = VAE(
+    vocab_size=len(stoi),
+    embed_dim=128,
+    hidden_dim=256,
+    latent_dim=64,
+    num_layers=1,
+    protein_embed_dim=768,
+    stoi=stoi
+).to(DEVICE)
+
+model.load_state_dict(torch.load("protein_conditional_vae.pth", map_location=DEVICE))
+model.eval()
+
+# Helper to fetch sequence by PDB ID
+
+def get_sequence_from_pdb_id(pdb_id):
+    pdbl = PDB.PDBList()
+    fn = pdbl.retrieve_pdb_file(pdb_id, pdir=".", file_format="pdb")
+    return extract_protein_sequence(fn)
+
+# Sampling function
+def sample_ligands_for_protein(protein_seq, n_samples=5):
+    esm_model, alphabet = esm.pretrained.esm1_t6_43M_UR50S()
+    esm_model = esm_model.eval().to(DEVICE)
+    batch_converter = alphabet.get_batch_converter()
+    data = [("protein", protein_seq)]
+    _, _, tokens = batch_converter(data)
+    tokens = tokens.to(DEVICE)
+    with torch.no_grad():
+        out = esm_model(tokens, repr_layers=[6], return_contacts=False)
+    repr6 = out["representations"][6]
+    prot_emb = repr6[:, 1:-1].mean(1)  # shape [1,768]
+    prot_emb = prot_emb.repeat(n_samples, 1)  # [n,768]
+
+    mu, logvar = model.enc(
+        torch.zeros((n_samples, MAX_LEN), dtype=torch.long, device=DEVICE),
+        prot_emb
+    )
+    std = (0.5 * logvar).exp()
+    zs = mu + std * torch.randn_like(std)
+
+    smiles = []
+    for i in range(n_samples):
+        out = model.dec(zs[i:i + 1], prot_emb[i:i + 1], teacher_forcing_ratio=0.0)
+        idxs = out.argmax(-1).squeeze().tolist()
+        chars = [itos[idx] for idx in idxs if itos[idx] not in ("<pad>", "<bos>", "<eos>")]
+        smiles.append("".join(chars))
+    return smiles
+
+# CLI Main
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--seq", help="Protein sequence (one-letter code)")
+    group.add_argument("--pdb", help="PDB ID to fetch and extract sequence")
+    parser.add_argument("-n", "--num", type=int, default=3, help="Number of ligands to generate")
+
+    args = parser.parse_args()
+
+    if args.pdb:
+        seq = get_sequence_from_pdb_id(args.pdb)
+    else:
+        seq = args.seq
+
+    print(f">>> Protein sequence (first 30 aa): {seq[:30]}... (length {len(seq)})")
+
+    ligands = sample_ligands_for_protein(seq, n_samples=args.num)
+    for i, smi in enumerate(ligands, 1):
+        print(f"Ligand #{i} SMILES: {smi}")
+# Evaluate generated ligands against your training data
+    training_smiles = []
+    # Optionally load your training SMILES from your dataset files here
+    # For example:
+    # with open('path_to_training_smiles.txt') as f:
+    #     training_smiles = [line.strip() for line in f]
+
+    if training_smiles:
+        print("\n=== Evaluation ===")
+        evaluate_model(ligands, training_smiles)
+    else:
+        print("\nNo training SMILES provided, skipping evaluation.")
+
+    # Save generated ligands to CSV
+    output_csv = "generated_ligands_ps.csv"
+    with open(output_csv, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["smiles"])
+        for smi in ligands:
+            writer.writerow([smi])
+
+    print(f"\nSaved generated ligands to {output_csv}")
