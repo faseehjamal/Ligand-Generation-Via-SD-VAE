@@ -1,0 +1,72 @@
+import argparse
+import torch
+from models.vae import VAE                          # make sure to import your VAE class
+from random_smiles_code import build_vocab           # reuse vocab function
+from torch import nn
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MAX_LEN = 100
+TEMPERATURE = 0.8
+
+def load_vocab_from_csv(csv_path: str) -> tuple[dict[str,int], list[str]]:
+    """
+    Build the same vocab that was used for training:
+    - Read CSV, sanitise & canonicalise (same pipeline)
+    - Build stoi/itos
+    """
+    from random_smiles_code import sanitise_and_canonicalise
+    import pandas as pd
+    df = pd.read_csv(csv_path)
+    smiles_raw = df["SMILES"].astype(str).tolist()
+    canon = []
+    for s in smiles_raw:
+        c = sanitise_and_canonicalise(s)
+        if c:
+            canon.append(c)
+    canon = sorted(set(canon))
+    return build_vocab(canon)
+
+def sample_random_smiles(model: nn.Module, itos: list[str], n: int, temp: float) -> list[str]:
+    model.eval()
+    with torch.no_grad():
+        z = torch.randn(n, model.encoder.fc_mu.out_features, device=DEVICE)
+        fake_logits = model.decoder(z, target=None, teacher_forcing_ratio=0.0)
+    generated = []
+    for i in range(n):
+        seq = ""
+        for t in range(fake_logits.size(1)):
+            probs = torch.softmax(fake_logits[i, t] / temp, dim=-1)
+            idx = torch.multinomial(probs, 1).item()
+            tok = itos[idx]
+            if tok == "<eos>":
+                break
+            if tok not in ("<pad>", "<bos>"):
+                seq += tok
+        generated.append(seq)
+    return generated
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", default="random_vae.pth",
+                        help="Trained random‐VAE checkpoint")
+    parser.add_argument("--csv", default="smiles_for_sdvae.csv",
+                        help="Path to SMILES CSV used for training")
+    parser.add_argument("--num", type=int, default=500,
+                        help="Number of SMILES to generate")
+    parser.add_argument("--temp", type=float, default=0.8,
+                        help="Sampling temperature")
+    parser.add_argument("--out", default="generated_smiles_random.txt",
+                        help="Output file (one SMILES per line)")
+    args = parser.parse_args()
+
+    # 1) Rebuild vocab & model
+    stoi, itos = load_vocab_from_csv(args.csv)
+    model = VAE(len(itos), 128, 256, 128, 2, stoi).to(DEVICE)
+    model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE))
+
+    # 2) Generate
+    gen = sample_random_smiles(model, itos, n=args.num, temp=args.temp)
+    with open(args.out, "w") as f:
+        for smi in gen:
+            f.write(smi + "\n")
+    print(f"✔ Generated {len(gen)} random SMILES → '{args.out}'")
