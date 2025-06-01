@@ -1,0 +1,49 @@
+import argparse
+import json
+import pathlib
+
+from rdkit import Chem
+from metrics import validity, novelty, scaffold, fcd, snn
+
+def load_smiles(path: str) -> list[str]:
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gen", required=True, help="Generated SMILES file (one per line)")
+    parser.add_argument("--ref", required=True, help="Reference SMILES file (one per line)")
+    parser.add_argument("--out", default="metrics_random.json", help="JSON output path")
+    args = parser.parse_args()
+
+    gen = load_smiles(args.gen)       # e.g., random_gen_1000.txt
+    ref = load_smiles(args.ref)       # e.g., smiles_for_sdvae.txt
+
+    # 1) Strict Validity
+    valid_smiles = [s for s in gen if validity.is_valid(s)]
+    validity_score = len(valid_smiles) / max(1, len(gen))
+
+    # 2) Uniqueness & Novelty
+    unique_score = novelty.uniqueness(valid_smiles)
+    novelty_score = novelty.novelty(valid_smiles, ref)
+
+    # 3) Scaffold Entropy
+    scaffold_entropy_score = scaffold.entropy(valid_smiles)
+
+    # 4) Fréchet ChemNet Distance
+    fcd_score = fcd.fcd(valid_smiles, ref)
+
+    # 5) Simplified Nearest‐Neighbour (fingerprint similarity)
+    snn_score = snn.snn(valid_smiles)
+
+    results = {
+        "validity": round(validity_score, 4),
+        "uniqueness": round(unique_score, 4),
+        "novelty": round(novelty_score, 4),
+        "scaffold_entropy": round(scaffold_entropy_score, 4),
+        "fcd": round(fcd_score, 4),
+        "snn": round(snn_score, 4)
+    }
+
+    pathlib.Path(args.out).write_text(json.dumps(results, indent=2))
+    print(json.dumps(results, indent=2))
